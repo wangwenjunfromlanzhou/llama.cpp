@@ -56,6 +56,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// true if all active implementations support accepted-prefix-aware processing
+bool common_speculative_can_process_prefixes(common_speculative * spec);
+
+// process only accepted prefixes for each sequence in the original batch
+// rows_by_seq[seq_id] < 0: process full contiguous range, == 0: skip, > 0: process first N rows
+bool common_speculative_process_prefixes(common_speculative * spec, const llama_batch & batch, const std::vector<int32_t> & rows_by_seq);
+
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);
 

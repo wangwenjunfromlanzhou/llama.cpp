@@ -614,6 +614,17 @@ class Gemma3NModel(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+GEMMA4_VISIBLE_TOKENS = {
+    b"<|channel>",
+    b"<channel|>",
+    b"<|tool_call>",
+    b"<tool_call|>",
+    b"<|tool_response>",
+    b"<tool_response|>",
+    b"<|\"|>",
+}
+
+
 @ModelBase.register("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM")
 class Gemma4Model(Gemma3Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4
@@ -623,24 +634,28 @@ class Gemma4Model(Gemma3Model):
         return 0.0
 
     def set_vocab(self):
+        self._set_vocab_gemma4()
+
+    def _set_vocab_gemma4(self, vocab_size: int | None = None):
         vocab = gguf.LlamaHfVocab(self.dir_model)
+        vocab_size = vocab.vocab_size if vocab_size is None else vocab_size
         tokens = []
         scores = []
         toktypes = []
-        visible_tokens = {"<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>", "<|\"|>"}
 
-        for text, score, toktype in vocab.all_tokens():
+        for idx, (text, score, toktype) in enumerate(vocab.all_tokens()):
+            if idx >= vocab_size:
+                break
             tokens.append(text)
             scores.append(score)
-            text_str = text.decode()
-            if text_str in visible_tokens:
-                # always render these tokens, so that the chat parser can read them
+            if text in GEMMA4_VISIBLE_TOKENS:
                 toktypes.append(gguf.TokenType.USER_DEFINED)
-                logger.info(f"Token '{text_str}' is set to USER_DEFINED")
+                logger.info(f"Token '{text.decode()}' is set to USER_DEFINED")
             else:
                 toktypes.append(toktype)
 
-        assert len(tokens) == vocab.vocab_size
+        if len(tokens) != vocab_size:
+            raise ValueError(f"Gemma4 tokenizer has {len(tokens)} tokens, expected {vocab_size}")
 
         self.gguf_writer.add_tokenizer_model("gemma4")
         self.gguf_writer.add_token_list(tokens)
@@ -762,6 +777,76 @@ class Gemma4Model(Gemma3Model):
             yield (name, data_torch)
             return
 
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Gemma4DSparkModel")
+class Gemma4DSparkModel(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.DSPARK
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError(
+                "Gemma4 DSpark draft model requires --target-model-dir to be specified. "
+                "Please provide the path to the target model directory containing the tokenizer."
+            )
+        logger.info(f"Gemma4 DSpark: Using tokenizer from target model: {self.target_model_dir}")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+        try:
+            vocab_size = self.hparams.get("vocab_size_per_layer_input", self.hparams["vocab_size"])
+            Gemma4Model._set_vocab_gemma4(self, vocab_size)
+        finally:
+            self.dir_model = original_dir
+
+        if (mask_token_id := self.hparams.get("mask_token_id")) is not None:
+            self.gguf_writer.add_mask_token_id(mask_token_id)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        target_layer_ids = self.hparams.get("target_layer_ids", [])
+        if target_layer_ids:
+            self.gguf_writer.add_target_layers([i + 1 for i in target_layer_ids])
+        self.gguf_writer.add_block_size(self.hparams.get("block_size", 7))
+        self.gguf_writer.add_markov_rank(self.hparams.get("markov_rank", 0))
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.endswith((
+            "embed_tokens.weight",
+            "pre_feedforward_layernorm.weight", 
+        )):
+            return None
+        if not name.startswith("model.") and not name.startswith("lm_head."):
+            name = "model." + name
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Gemma4 k_eq_v: checkpoint ships only q/k_proj. We still synthesize v_proj
+        # = k_proj so the GGUF tensor count matches the DSpark loader expectation
+        # (it counts attn_v as required at the file level). The C++ graph detects
+        # k_eq_v via hparams and uses V = v_norm(k_proj(x)) regardless of v_proj.
+        if self.hparams.get("attention_k_eq_v") and name.endswith(".self_attn.k_proj.weight"):
+            yield from super().modify_tensors(data_torch, name, bid)
+            yield from super().modify_tensors(data_torch, name.replace(".self_attn.k_proj.weight", ".self_attn.v_proj.weight"), bid)
+            return
+        # ponytail: tensor_mapping.py collides post_attention_layernorm into
+        # FFN_NORM (Llama-style alias). Gemma4 needs it as a distinct sandwich
+        # norm (ATTN_POST_NORM); bypass the mapping and format the GGUF name
+        # directly so the C++ loader's ATTN_POST_NORM slot picks it up.
+        if name.endswith("post_attention_layernorm.weight") and bid is not None:
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_POST_NORM, bid)
+            yield (new_name, data_torch)
+            return
+        # ponytail: pre_feedforward_layernorm has no DSPARK mapping (FFN_PRE_NORM
+        # not in arch tensor list); emit it as FFN_NORM directly -- that's the
+        # slot dflash.cpp loads as the pre-ffn norm.
+        if name.endswith("pre_feedforward_layernorm.weight") and bid is not None:
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_NORM, bid)
+            yield (new_name, data_torch)
+            return
         yield from super().modify_tensors(data_torch, name, bid)
 
 

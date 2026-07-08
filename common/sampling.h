@@ -34,6 +34,12 @@
 
 struct common_sampler;
 
+struct common_sampler_speculative_timings {
+    double target_sample_ms = 0.0;
+    double probability_check_ms = 0.0;
+    double accept_loop_ms = 0.0;
+};
+
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
@@ -80,10 +86,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        bool grammar_first = false,
+        common_sampler_speculative_timings * timings = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        bool grammar_first = false,
+        common_sampler_speculative_timings * timings = nullptr);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

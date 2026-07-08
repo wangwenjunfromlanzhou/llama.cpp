@@ -272,6 +272,17 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    int32_t spec_process_rows = 0;
+    int32_t spec_process_skipped_rows = 0;
+    double spec_draft_ms = 0.0;
+    double spec_process_ms = 0.0;
+    double spec_verify_ms = 0.0;
+    double spec_verify_sampler_clone_ms = 0.0;
+    double spec_verify_target_sample_ms = 0.0;
+    double spec_verify_probability_check_ms = 0.0;
+    double spec_verify_accept_loop_ms = 0.0;
+    double spec_checkpoint_ms = 0.0;
+    double spec_rollback_ms = 0.0;
 
     json to_json() const;
 };

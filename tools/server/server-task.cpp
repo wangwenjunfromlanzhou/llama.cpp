@@ -255,6 +255,17 @@ json result_timings::to_json() const {
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["spec_process_rows"] = spec_process_rows;
+        base["spec_process_skipped_rows"] = spec_process_skipped_rows;
+        base["spec_draft_ms"] = spec_draft_ms;
+        base["spec_process_ms"] = spec_process_ms;
+        base["spec_verify_ms"] = spec_verify_ms;
+        base["spec_verify_sampler_clone_ms"] = spec_verify_sampler_clone_ms;
+        base["spec_verify_target_sample_ms"] = spec_verify_target_sample_ms;
+        base["spec_verify_probability_check_ms"] = spec_verify_probability_check_ms;
+        base["spec_verify_accept_loop_ms"] = spec_verify_accept_loop_ms;
+        base["spec_checkpoint_ms"] = spec_checkpoint_ms;
+        base["spec_rollback_ms"] = spec_rollback_ms;
     }
 
     return base;

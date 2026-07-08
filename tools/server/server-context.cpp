@@ -295,7 +295,25 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
+    int32_t n_spec_process_rows = 0;
+    int32_t n_spec_process_skipped_rows = 0;
+    double t_spec_draft = 0.0;
+    double t_spec_process = 0.0;
+    double t_spec_verify = 0.0;
+    double t_spec_verify_sampler_clone = 0.0;
+    double t_spec_verify_target_sample = 0.0;
+    double t_spec_verify_probability_check = 0.0;
+    double t_spec_verify_accept_loop = 0.0;
+    double t_spec_checkpoint = 0.0;
+    double t_spec_rollback = 0.0;
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    // Dynamic speculative draft limit. 0 means use the configured speculative n_max.
+    int32_t spec_draft_n_max_dynamic = 0;
+    int32_t spec_draft_low_accept_streak = 0;
+    int32_t spec_draft_full_accept_streak = 0;
+    int32_t spec_draft_cooldown = 0;
+    int32_t spec_draft_cooldown_level = 0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -323,7 +341,23 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
+        n_spec_process_rows = 0;
+        n_spec_process_skipped_rows = 0;
+        t_spec_draft = 0.0;
+        t_spec_process = 0.0;
+        t_spec_verify = 0.0;
+        t_spec_verify_sampler_clone = 0.0;
+        t_spec_verify_target_sample = 0.0;
+        t_spec_verify_probability_check = 0.0;
+        t_spec_verify_accept_loop = 0.0;
+        t_spec_checkpoint = 0.0;
+        t_spec_rollback = 0.0;
         n_accepted_per_pos.clear();
+        spec_draft_n_max_dynamic = 0;
+        spec_draft_low_accept_streak = 0;
+        spec_draft_full_accept_streak = 0;
+        spec_draft_cooldown = 0;
+        spec_draft_cooldown_level = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -423,10 +457,16 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    int get_n_draft_max() {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        if (spec_draft_cooldown > 0) {
+            spec_draft_cooldown--;
+            SLT_DBG(*this, "speculative cooldown active, remaining = %d, level = %d\n", spec_draft_cooldown, spec_draft_cooldown_level);
             return 0;
         }
 
@@ -439,9 +479,65 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
-        SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+        if (spec_draft_n_max_dynamic > 0) {
+            n_draft_max = std::min(n_draft_max, spec_draft_n_max_dynamic);
+        }
+
+        SLT_DBG(*this, "max possible draft: %d, dynamic n_max = %d\n", n_draft_max, spec_draft_n_max_dynamic);
 
         return n_draft_max;
+    }
+
+    void update_speculative_n_max(const int32_t n_draft, const int32_t n_accepted, const int32_t n_max_configured) {
+        if (n_draft <= 0 || n_max_configured <= 1) {
+            return;
+        }
+
+        const int32_t n_cur = spec_draft_n_max_dynamic > 0 ? spec_draft_n_max_dynamic : n_max_configured;
+
+        if (n_accepted == n_draft) {
+            spec_draft_low_accept_streak = 0;
+            spec_draft_full_accept_streak++;
+
+            if (spec_draft_n_max_dynamic > 0 && spec_draft_full_accept_streak >= 4) {
+                const int32_t n_next = std::min(n_max_configured, spec_draft_n_max_dynamic + 1);
+                SLT_INF(*this, "speculative dynamic n_max increase: %d -> %d\n", spec_draft_n_max_dynamic, n_next);
+                spec_draft_n_max_dynamic = n_next == n_max_configured ? 0 : n_next;
+                if (spec_draft_n_max_dynamic == 0) {
+                    spec_draft_cooldown_level = 0;
+                }
+                spec_draft_full_accept_streak = 0;
+            }
+            return;
+        }
+
+        spec_draft_full_accept_streak = 0;
+
+        // Treat zero accepted tokens and <25% acceptance as low-value speculation.
+        if (n_accepted == 0 || 4*n_accepted < n_draft) {
+            spec_draft_low_accept_streak++;
+            if (spec_draft_low_accept_streak >= 4) {
+                if (n_cur > 1) {
+                    const int32_t n_next = std::max(1, n_cur / 2);
+                    SLT_INF(*this, "speculative dynamic n_max decrease: %d -> %d (accepted %d/%d)\n", n_cur, n_next, n_accepted, n_draft);
+                    spec_draft_n_max_dynamic = n_next;
+                } else {
+                    static constexpr int32_t SPEC_DRAFT_COOLDOWN_BASE_TOKENS = 32;
+                    static constexpr int32_t SPEC_DRAFT_COOLDOWN_MAX_LEVEL   = 4;
+                    spec_draft_cooldown_level = std::min(SPEC_DRAFT_COOLDOWN_MAX_LEVEL, spec_draft_cooldown_level + 1);
+                    spec_draft_cooldown = SPEC_DRAFT_COOLDOWN_BASE_TOKENS << (spec_draft_cooldown_level - 1);
+                    spec_draft_n_max_dynamic = 1;
+                    SLT_INF(*this, "speculative cooldown start: %d tokens, level = %d (accepted %d/%d at n_max=1)\n",
+                            spec_draft_cooldown, spec_draft_cooldown_level, n_accepted, n_draft);
+                }
+                spec_draft_low_accept_streak = 0;
+            }
+        } else {
+            spec_draft_low_accept_streak = 0;
+            if (spec_draft_cooldown_level > 0) {
+                spec_draft_cooldown_level--;
+            }
+        }
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
@@ -518,8 +614,19 @@ struct server_slot {
 
         // Add speculative metrics
         if (n_draft_total > 0) {
-            timings.draft_n          = n_draft_total;
-            timings.draft_n_accepted = n_draft_accepted;
+            timings.draft_n                   = n_draft_total;
+            timings.draft_n_accepted          = n_draft_accepted;
+            timings.spec_process_rows         = n_spec_process_rows;
+            timings.spec_process_skipped_rows = n_spec_process_skipped_rows;
+            timings.spec_draft_ms                    = t_spec_draft;
+            timings.spec_process_ms                  = t_spec_process;
+            timings.spec_verify_ms                   = t_spec_verify;
+            timings.spec_verify_sampler_clone_ms     = t_spec_verify_sampler_clone;
+            timings.spec_verify_target_sample_ms     = t_spec_verify_target_sample;
+            timings.spec_verify_probability_check_ms = t_spec_verify_probability_check;
+            timings.spec_verify_accept_loop_ms       = t_spec_verify_accept_loop;
+            timings.spec_checkpoint_ms               = t_spec_checkpoint;
+            timings.spec_rollback_ms                 = t_spec_rollback;
         }
 
         return timings;
@@ -2994,11 +3101,17 @@ private:
 
         // generate the actual drafts (if any)
         {
+            const int64_t t_start = ggml_time_us();
             common_speculative_draft(spec.get());
+            const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+            for (auto * slot : drafting) {
+                slot->t_spec_draft += t_ms;
+            }
         }
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
+            const int64_t t_start_checkpoint = ggml_time_us();
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
@@ -3041,6 +3154,7 @@ private:
                     ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
+            slot.t_spec_checkpoint += (ggml_time_us() - t_start_checkpoint) / 1000.0;
         });
 
         // update the batch with the sampled/drafted tokens
@@ -3668,14 +3782,34 @@ private:
             return false; // retry with the updated n_batch
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
-            SRV_ERR("%s", "failed to process speculative batch\n");
+        bool defer_speculative_process = common_speculative_can_process_prefixes(spec.get());
+        if (defer_speculative_process) {
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                GGML_ASSERT(batch_view.n_seq_id[i] == 1);
+                const llama_seq_id seq_id = batch_view.seq_id[i][0];
+                auto it = std::find_if(slots.begin(), slots.end(), [seq_id](const server_slot & slot) { return slot.id == seq_id; });
+                if (it == slots.end() || it->spec_draft.empty()) {
+                    defer_speculative_process = false;
+                    break;
+                }
+            }
+        }
 
-            // TODO: handle error
-            throw std::runtime_error("failed to process speculative batch");
+        if (!defer_speculative_process) {
+            const int64_t t_start_process = ggml_time_us();
+            if (!common_speculative_process(spec.get(), batch_view)) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+
+                // TODO: handle error
+                throw std::runtime_error("failed to process speculative batch");
+            }
+            const double t_ms = (ggml_time_us() - t_start_process) / 1000.0;
+            for (auto & slot : slots) {
+                if (!slot.spec_draft.empty()) {
+                    slot.t_spec_process += t_ms;
+                    slot.n_spec_process_rows += (int32_t) slot.spec_draft.size() + 1;
+                }
+            }
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -3724,6 +3858,25 @@ private:
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
+
+        auto is_deferred_speculative_batch = [&]() {
+            if (!common_speculative_can_process_prefixes(spec.get())) {
+                return false;
+            }
+
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                GGML_ASSERT(batch_view.n_seq_id[i] == 1);
+                const llama_seq_id seq_id = batch_view.seq_id[i][0];
+                auto it = std::find_if(slots.begin(), slots.end(), [seq_id](const server_slot & slot) { return slot.id == seq_id; });
+                if (it == slots.end() || it->spec_draft.empty()) {
+                    return false;
+                }
+            }
+
+            return batch_view.n_tokens > 0;
+        };
+
+        const bool process_prefixes_after_accept = is_deferred_speculative_batch();
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -3833,11 +3986,20 @@ private:
 
             // verify and try to accept the draft
             {
+                const int64_t t_start_verify = ggml_time_us();
+
                 // save the sampler sampler state in case we need to restore it
+                const int64_t t_start_clone = ggml_time_us();
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                slot.t_spec_verify_sampler_clone += (ggml_time_us() - t_start_clone) / 1000.0;
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                common_sampler_speculative_timings verify_timings;
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, &verify_timings);
+                slot.t_spec_verify_target_sample += verify_timings.target_sample_ms;
+                slot.t_spec_verify_probability_check += verify_timings.probability_check_ms;
+                slot.t_spec_verify_accept_loop += verify_timings.accept_loop_ms;
+                slot.t_spec_verify += (ggml_time_us() - t_start_verify) / 1000.0;
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3851,6 +4013,7 @@ private:
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
+                        const int64_t t_start_rollback = ggml_time_us();
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
@@ -3876,6 +4039,7 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
+                        slot.t_spec_rollback += (ggml_time_us() - t_start_rollback) / 1000.0;
 
                         return;
                     }
@@ -3883,6 +4047,19 @@ private:
 
                 if (trace > 0) {
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                }
+
+                if (process_prefixes_after_accept) {
+                    std::vector<int32_t> rows_by_seq(params_base.n_parallel, 0);
+                    rows_by_seq[slot.id] = (int32_t) accepted.size();
+                    const int64_t t_start_process = ggml_time_us();
+                    if (!common_speculative_process_prefixes(spec.get(), batch_view, rows_by_seq)) {
+                        SRV_ERR("%s", "failed to process speculative accepted prefix\n");
+                        throw std::runtime_error("failed to process speculative accepted prefix");
+                    }
+                    slot.t_spec_process += (ggml_time_us() - t_start_process) / 1000.0;
+                    slot.n_spec_process_rows += (int32_t) accepted.size();
+                    slot.n_spec_process_skipped_rows += (int32_t) (n_draft + 1 - accepted.size());
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
@@ -3899,6 +4076,7 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += ids.size() - 1;
             slot.n_draft_verif_steps += 1;
+            slot.update_speculative_n_max((int32_t) n_draft, (int32_t) ids.size() - 1, common_speculative_n_max(&params_base.speculative));
 
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);

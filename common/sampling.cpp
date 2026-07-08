@@ -441,6 +441,45 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+static bool common_sampler_can_speculative_greedy_fast_path(const common_sampler * gsmpl) {
+    const auto & p = gsmpl->params;
+
+    return !gsmpl->grmr &&
+           !gsmpl->rbudget &&
+           !p.backend_sampling &&
+           !p.has_logit_bias() &&
+           p.mirostat == 0 &&
+           p.temp <= 0.0f &&
+           p.dynatemp_range == 0.0f &&
+           p.top_k == 1 &&
+           p.dry_multiplier == 0.0f &&
+           p.penalty_repeat == 1.0f &&
+           p.penalty_freq == 0.0f &&
+           p.penalty_present == 0.0f &&
+           p.xtc_probability == 0.0f &&
+           p.top_n_sigma < 0.0f &&
+           p.adaptive_target < 0.0f;
+}
+
+static llama_token common_sampler_sample_greedy_fast(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    GGML_UNUSED(gsmpl);
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    GGML_ASSERT(logits != nullptr);
+
+    llama_token best = 0;
+    for (llama_token token_id = 1; token_id < n_vocab; ++token_id) {
+        if (logits[token_id] > logits[best]) {
+            best = token_id;
+        }
+    }
+
+    return best;
+}
+
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
     if (!gsmpl) {
         return;
@@ -621,43 +660,76 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        bool grammar_first,
+        common_sampler_speculative_timings * timings) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const bool greedy_fast_path = !grammar_first && common_sampler_can_speculative_greedy_fast_path(gsmpl);
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        int64_t t_start = ggml_time_us();
+        const llama_token id = greedy_fast_path ? common_sampler_sample_greedy_fast(gsmpl, ctx, idxs[i]) : common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (timings) {
+            timings->target_sample_ms += (ggml_time_us() - t_start) / 1000.0;
+        }
 
+        t_start = ggml_time_us();
         common_sampler_accept(gsmpl, id, true);
-
         result.push_back(id);
+        if (timings) {
+            timings->accept_loop_ms += (ggml_time_us() - t_start) / 1000.0;
+        }
 
-        if (draft[i] != id) {
+        t_start = ggml_time_us();
+        const bool accepted = draft[i] == id;
+        if (timings) {
+            timings->probability_check_ms += (ggml_time_us() - t_start) / 1000.0;
+        }
+
+        if (!accepted) {
             break;
         }
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        int64_t t_start = ggml_time_us();
+        const llama_token id = greedy_fast_path ? common_sampler_sample_greedy_fast(gsmpl, ctx, idxs[i]) : common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (timings) {
+            timings->target_sample_ms += (ggml_time_us() - t_start) / 1000.0;
+        }
 
+        t_start = ggml_time_us();
         common_sampler_accept(gsmpl, id, true);
-
         result.push_back(id);
+        if (timings) {
+            timings->accept_loop_ms += (ggml_time_us() - t_start) / 1000.0;
+        }
     }
 
     return result;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        bool grammar_first,
+        common_sampler_speculative_timings * timings) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {
         idxs[i] = i;
     }
 
-    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first, timings);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

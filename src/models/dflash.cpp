@@ -47,11 +47,22 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
+        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+
+        // sandwich norms + per-layer scalar (gemma4 DSpark). All optional: Qwen
+        // DSpark checkpoints do not ship any of them, so the decoder graph must
+        // skip each one when its tensor is null.
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
+        layer.ffn_post_norm  = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM,  "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
+        layer.out_scale      = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), { 1u },   TENSOR_NOT_REQUIRED);
+
+        // Gemma4 ships per-layer rope_freqs for proportional rope on full-attn layers.
+        // Qwen DSpark does not, so NOT_REQUIRED keeps the count clean for both.
+        layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), { n_embd_head_k/2 }, TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
@@ -126,7 +137,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         inp_attn = build_attn_inp_kv();
     }
 
-    const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
+    // ponytail: Gemma4 DSpark test -- Q/K norms handle scaling implicitly, so the
+    // attention scale must be 1.0. If this restores acceptance, we add an arch-level
+    // hparam (attention.scale) and branch on it instead of hard-coding.
+    const float kq_scale = 1.0f;
 
     // KV cache injection
     if (ubatch.embd) {
@@ -143,15 +157,21 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
+            // Gemma4 k_eq_v: same V handling as the token path (V = v_norm(k)).
             ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g);
+            ggml_tensor * Vsrc = (layer.wv != nullptr) ? build_lora_mm(layer.wv, inp_g) : Kcur;
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+            Vsrc = ggml_reshape_3d(ctx0, Vsrc, n_embd_head, n_head_kv, n_tokens);
 
             Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+            ggml_tensor * Vcur = (layer.wv == nullptr)
+                ? ggml_rms_norm(ctx0, Vsrc, hparams.f_norm_rms_eps)
+                : build_norm(Vsrc, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+            // ponytail: Gemma4 full-attn layers ship per-layer rope_freqs (proportional rope).
+            // Qwen DSpark has none -> rope_freqs is nullptr and ggml_rope_ext falls back to plain rope.
             Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
+                    ctx0, Kcur, inp_pos, layer.rope_freqs,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
@@ -194,6 +214,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_set_input(inp->tokens);
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    // ponytail: Gemma4 scales embeddings by sqrt(hidden_size) before the first
+    // layer. Qwen3 DSpark does not, so this is unconditional for now -- if Qwen
+    // regresses, gate on hparams (e.g. rope_theta or a new flag).
+    inpL = ggml_scale(ctx0, inpL, sqrtf(float(n_embd)));
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -206,22 +230,31 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm);
         ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm);
-        ggml_tensor * Vcur = build_lora_mm(layer.wv, noise_norm);
+        // Gemma4 k_eq_v: V = v_norm(k_proj(x)) (no separate v_proj weight, no
+        // RoPE on V, v_norm is pure normalization with no learnable scale).
+        // When the checkpoint ships a real v_proj, use it; otherwise reuse Kcur.
+        ggml_tensor * Vsrc = (layer.wv != nullptr) ? build_lora_mm(layer.wv, noise_norm) : Kcur;
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        Vsrc = ggml_reshape_3d(ctx0, Vsrc, n_embd_head, n_head_kv, n_tokens);
 
         Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+        // V gets a pure RMSNorm (no weight) when k_eq_v is in effect; otherwise
+        // reuse attn_k_norm like the Qwen3 path.
+        ggml_tensor * Vcur = (layer.wv == nullptr)
+            ? ggml_rms_norm(ctx0, Vsrc, hparams.f_norm_rms_eps)
+            : build_norm(Vsrc, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
 
+        // ponytail: Gemma4 proportional rope uses per-layer rope_freqs; Qwen DSpark has none.
         Qcur = ggml_rope_ext(
-                ctx0, Qcur, inp_pos, nullptr,
+                ctx0, Qcur, inp_pos, layer.rope_freqs,
                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow
                 );
         Kcur = ggml_rope_ext(
-                ctx0, Kcur, inp_pos, nullptr,
+                ctx0, Kcur, inp_pos, layer.rope_freqs,
                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow
                 );
@@ -233,6 +266,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * cur = use_iswa
             ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
             : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+
+        // Gemma4 sandwich norm: post_attention_layernorm before the residual add.
+        if (layer.attn_post_norm != nullptr) {
+            cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "attn_post_norm", il);
+        }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
@@ -248,10 +287,24 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
+        // Gemma4 sandwich norm: post_feedforward_layernorm before the residual add.
+        if (layer.ffn_post_norm != nullptr) {
+            cur = build_norm(cur, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "ffn_post_norm", il);
+        }
+
         cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "l_out", il);
 
-        inpL = cur;
+        // Gemma4 sandwich-norm layers are trained with a per-layer learnable
+        // scalar (layer_scalar) applied to the layer output. Qwen DSpark
+        // checkpoints have no such tensor -- skip the multiply when absent.
+        if (layer.out_scale != nullptr) {
+            inpL = ggml_mul(ctx0, cur, layer.out_scale);
+            cb(inpL, "l_out_scaled", il);
+        } else {
+            inpL = cur;
+        }
     }
 
     ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
