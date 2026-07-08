@@ -815,10 +815,7 @@ class Gemma4DSparkModel(Gemma4Model):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
-        if name.endswith((
-            "embed_tokens.weight",
-            "pre_feedforward_layernorm.weight", 
-        )):
+        if name.endswith("embed_tokens.weight"):
             return None
         if not name.startswith("model.") and not name.startswith("lm_head."):
             name = "model." + name
