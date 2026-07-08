@@ -41,6 +41,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
+    // ponytail: draft carries its own token_embd so it does not have to borrow
+    // the target's (Unsloth target GGUFs trim/tie it). NOT_REQUIRED keeps the
+    // old "borrow from ctx_other" path working when the draft omits it.
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
