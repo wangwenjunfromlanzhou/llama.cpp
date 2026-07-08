@@ -810,6 +810,7 @@ class Gemma4DSparkModel(Gemma4Model):
             self.gguf_writer.add_target_layers([i + 1 for i in target_layer_ids])
         self.gguf_writer.add_block_size(self.hparams.get("block_size", 7))
         self.gguf_writer.add_markov_rank(self.hparams.get("markov_rank", 0))
+        self.gguf_writer.add_embedding_scale(self.hparams["hidden_size"] ** 0.5)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

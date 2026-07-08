@@ -6,6 +6,7 @@
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
@@ -214,10 +215,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_set_input(inp->tokens);
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-    // ponytail: Gemma4 scales embeddings by sqrt(hidden_size) before the first
-    // layer. Qwen3 DSpark does not, so this is unconditional for now -- if Qwen
-    // regresses, gate on hparams (e.g. rope_theta or a new flag).
-    inpL = ggml_scale(ctx0, inpL, sqrtf(float(n_embd)));
+    if (hparams.f_embedding_scale != 0.0f) {
+        inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
+    }
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));

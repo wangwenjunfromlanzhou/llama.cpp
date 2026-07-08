@@ -11,7 +11,8 @@ void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_BLOCK_SIZE, hparams.n_dspark_block, /*required*/ true);
     // Gemma4 DSpark ships final_logit_softcapping in its config; Qwen DSpark
-    // does not, and the default 0.0f disables the softcap.
+    // does not, so override the Gemma-family hparam default and leave softcap disabled.
+    hparams.f_final_logit_softcapping = 0.0f;
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
 }
 
