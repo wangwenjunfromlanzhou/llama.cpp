@@ -815,8 +815,9 @@ class Gemma4DSparkModel(Gemma4Model):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
-        if name.endswith("embed_tokens.weight"):
-            return None
+        # ponytail: keep embed_tokens so the draft carries its own token_embd and
+        # does not depend on the target's embedding (Unsloth target GGUFs often
+        # trim/tie token_embd, which corrupts draft logits when ctx_other is used).
         if not name.startswith("model.") and not name.startswith("lm_head."):
             name = "model." + name
         return super().filter_tensors((name, gen))
