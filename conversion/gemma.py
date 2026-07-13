@@ -812,6 +812,22 @@ class Gemma4DSparkModel(Gemma4Model):
         self.gguf_writer.add_markov_rank(self.hparams.get("markov_rank", 0))
         self.gguf_writer.add_embedding_scale(self.hparams["hidden_size"] ** 0.5)
 
+        # Gemma4 DSpark full-attn layers use proportional rope: n_rot stays at
+        # head_dim (512) and the ROPE_FREQS tensor (inherited from Gemma4Model.
+        # generate_extra_tensors) zeroes the unrotated 75% via 1e30 freq factors.
+        # We only override rope_freq_base, hidden_activation, and attn softcap.
+        # Qwen3 DSpark leaves all of these unset.
+        rope_params = self.hparams.get("rope_parameters", {}).get("full_attention", {})
+        if "rope_theta" in rope_params:
+            self.gguf_writer.add_rope_freq_base(rope_params["rope_theta"])
+        if (act := self.hparams.get("hidden_activation")) is not None:
+            # Normalize HF names (gelu_pytorch_tanh, gelu_new, etc.) to the canonical
+            # labels dspark.cpp recognizes ("gelu" -> GELU+PAR / GEGLU).
+            norm = "gelu" if "gelu" in act and "silu" not in act else act
+            self.gguf_writer.add_hidden_act(norm)
+        if (attn_cap := self.hparams.get("attn_logit_softcapping")) is not None:
+            self.gguf_writer.add_attn_logit_softcapping(attn_cap)
+
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item

@@ -150,6 +150,13 @@ struct common_speculative_impl {
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
 
+    // ponytail: acceptance by absolute generated-token position, bucketed.
+    // Buckets: [0,50),[50,100),[100,200),[200,400),[400,+). Diagnoses whether
+    // long outputs degrade (KV/rope extrapolation or draft capacity) vs.
+    // block-internal position decay. Upgrade path: make edges configurable.
+    size_t n_acc_bucket[5] = {0};
+    size_t n_dft_bucket[5] = {0};
+
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
@@ -2647,6 +2654,19 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+
+                    // ponytail: draft tokens bucketed by absolute position (aligns with n_acc_bucket)
+                    static const size_t DEDGE[6] = {0, 50, 100, 200, 400, ~size_t(0)};
+                    const size_t dbase = impl->n_acc_tokens;
+                    for (size_t i = 0; i < result.size(); ++i) {
+                        const size_t pos = dbase + i;
+                        for (int b = 0; b < 5; ++b) {
+                            if (pos >= DEDGE[b] && pos < DEDGE[b+1]) {
+                                impl->n_dft_bucket[b]++;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2689,6 +2709,19 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (n_accepted > 0) {
             impl->n_acc_drafts++;
             impl->n_acc_tokens += n_accepted;
+        }
+
+        // ponytail: bucket by absolute accepted-token position to spot long-output degradation.
+        static const size_t EDGE[6] = {0, 50, 100, 200, 400, ~size_t(0)};
+        const size_t base = impl->n_acc_tokens; // accepted count before this call
+        for (size_t i = 0; i < n_accepted; ++i) {
+            const size_t pos = base + i;
+            for (int b = 0; b < 5; ++b) {
+                if (pos >= EDGE[b] && pos < EDGE[b+1]) {
+                    impl->n_acc_bucket[b]++;
+                    break;
+                }
+            }
         }
 
         impl->accept(seq_id, n_accepted, false);
@@ -2741,6 +2774,14 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
             str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            // ponytail: per-call draft time. Compare against baseline 1/tok/s to see
+            // if draft overhead dominates (e.g. draft 5ms + verify 35ms = 40ms/round).
+            if (impl->n_call_draft > 0) {
+                std::ostringstream r;
+                r << std::fixed << std::setprecision(3)
+                  << (double)impl->t_draft_us / 1000.0 / (double)impl->n_call_draft;
+                str_perf += ", dft/call = " + r.str() + " ms";
+            }
         } else {
             str_perf = "";
         }
@@ -2760,6 +2801,18 @@ void common_speculative_print_stats(const common_speculative * spec) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(2) << mean;
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
+
+            // ponytail: per-bucket acceptance [0,50) [50,100) [100,200) [200,400) [400,+)
+            std::ostringstream bkt;
+            bkt << std::fixed << std::setprecision(3);
+            const char* bname[5] = {"[0,50)","[50,100)","[100,200)","[200,400)","[400,+)"};
+            for (int b = 0; b < 5; ++b) {
+                if (impl->n_dft_bucket[b] > 0) {
+                    const double r = (double)impl->n_acc_bucket[b] / (double)impl->n_dft_bucket[b];
+                    bkt << bname[b] << "=" << r << " ";
+                }
+            }
+            str_stats += ", #acc/bucket = " + bkt.str();
         }
 
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",

@@ -289,7 +289,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 layer.ffn_gate, NULL, NULL,
                 layer.ffn_down, NULL, NULL,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                hparams.f_dspark_ffn_gelu ? LLM_FFN_GELU : LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
         // Gemma4 sandwich norm: post_feedforward_layernorm before the residual add.

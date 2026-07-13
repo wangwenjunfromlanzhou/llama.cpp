@@ -10,10 +10,22 @@ void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_NONE;
 
     ml.get_key(LLM_KV_BLOCK_SIZE, hparams.n_dspark_block, /*required*/ true);
+
     // Gemma4 DSpark ships final_logit_softcapping in its config; Qwen DSpark
     // does not, so override the Gemma-family hparam default and leave softcap disabled.
     hparams.f_final_logit_softcapping = 0.0f;
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
+
+    // Gemma4 DSpark uses GELU+PAR (GEGLU); Qwen3 DSpark uses SiLU+PAR (SwiGLU).
+    // Gate via hidden_activation metadata so the dflash graph picks the right op.
+    std::string hidden_act = "silu";
+    ml.get_key(LLM_KV_HIDDEN_ACT, hidden_act, false);
+    hparams.f_dspark_ffn_gelu = (hidden_act == "gelu" || hidden_act == "geglu");
+
+    // Gemma family applies attn_logit_softcapping (=50.0) to QK; Qwen DSpark does not.
+    // hparams.f_attn_logit_softcapping defaults to 50.0 already; only flip the gate on.
+    const bool has_attn_cap = ml.get_key(LLM_KV_ATTN_LOGIT_SOFTCAPPING, hparams.f_attn_logit_softcapping, false);
+    hparams.attn_soft_cap = has_attn_cap;
 }
 
 void llama_model_dspark::load_arch_tensors(llama_model_loader & ml) {

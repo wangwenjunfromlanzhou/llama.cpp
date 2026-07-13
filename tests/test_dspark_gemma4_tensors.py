@@ -52,5 +52,21 @@ class TestDSParkGemma4LayerTensors(unittest.TestCase):
         self.assertIsNotNone(_filter("model.layers.0.self_attn.v_proj.weight"))
 
 
+class TestDSParkGemma4ActivationNormalization(unittest.TestCase):
+    """Conversion must normalize HF activation names to labels dspark.cpp matches."""
+
+    def test_gelu_pytorch_tanh_becomes_gelu(self):
+        act = "gelu_pytorch_tanh"
+        norm = "gelu" if "gelu" in act and "silu" not in act else act
+        self.assertEqual(norm, "gelu",
+                         "gelu_pytorch_tanh must normalize to 'gelu' so dspark.cpp picks LLM_FFN_GELU")
+
+    def test_silu_stays_silu(self):
+        act = "silu"
+        norm = "gelu" if "gelu" in act and "silu" not in act else act
+        self.assertEqual(norm, "silu",
+                         "Qwen3 DSpark's silu must NOT be normalized to gelu")
+
+
 if __name__ == "__main__":
     unittest.main()

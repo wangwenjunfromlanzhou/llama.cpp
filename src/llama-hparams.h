@@ -190,6 +190,10 @@ struct llama_hparams {
     // for DSpark: the trained draft block size, in tokens (anchor + n-1 masks)
     uint32_t n_dspark_block = 0;
 
+    // ponytail: Gemma4 DSpark uses GELU+PAR (GEGLU); Qwen3 DSpark uses SiLU+PAR (SwiGLU).
+    // Gate via metadata so dflash.cpp build_ffn picks the right op without per-arch branches.
+    bool f_dspark_ffn_gelu = false;
+
     // input embedding dimension (0 = use n_embd)
     uint32_t n_embd_inp_impl = 0;
 
