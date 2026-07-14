@@ -1247,6 +1247,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl_dra
             params.n_max = block_size;
         }
 
+        // The confidence head emits its [0,1] per-position output through the
+        // t_h_nextn channel (broadcast to [n_embd, n_tok]). Enable the nextn
+        // extraction path so draft() can read it via llama_get_embeddings_nextn_ith.
+        if (params.conf_min > 0.0f) {
+            llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        }
+
         LOG_INF("%s: adding speculative implementation 'draft-dspark'\n", __func__);
         LOG_INF("%s: - block_size=%d, n_max=%d\n", __func__, block_size, params.n_max);
     }
@@ -1296,6 +1303,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl_dra
             return;
         }
 
+        // conf head output flows through t_h_nextn (broadcast to [n_embd, n_tok]).
+        // Only read when conf_min is set; the first float of each row is conf.
+        const bool want_conf = params.conf_min > 0.0f;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1304,7 +1315,18 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl_dra
             auto & result = *dp.result;
 
             const int32_t beg = i_block_beg[seq_id];
-            const int32_t nb  = n_block[seq_id]; // drafts to keep (<= block_size)
+            int32_t       nb  = n_block[seq_id]; // drafts to keep (<= block_size)
+
+            // truncate the block tail where confidence drops below conf_min.
+            if (want_conf) {
+                while (nb > 1) {
+                    const float * row = llama_get_embeddings_nextn_ith(ctx_dft, beg + nb - 1);
+                    if (row == nullptr || row[0] >= params.conf_min) {
+                        break;
+                    }
+                    --nb;
+                }
+            }
 
             auto * smpl = smpls[seq_id].get();
             // DSpark outputs draft logits at block positions 0..nb-1; position 0 is biased by the anchor token.

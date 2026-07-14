@@ -143,10 +143,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         inp_attn = build_attn_inp_kv();
     }
 
-    // ponytail: Gemma4 DSpark test -- Q/K norms handle scaling implicitly, so the
-    // attention scale must be 1.0. If this restores acceptance, we add an arch-level
-    // hparam (attention.scale) and branch on it instead of hard-coding.
-    const float kq_scale = 1.0f;
+    // Gemma4 DSpark: Q/K norms handle scaling implicitly -> attention.scale=1.0
+    // (written by conversion). Qwen3 DSpark leaves it unset -> 1/sqrt(head_dim).
+    const float kq_scale = hparams.f_attention_scale == 0.0f
+        ? 1.0f / sqrtf(float(n_embd_head))
+        : hparams.f_attention_scale;
 
     // KV cache injection
     if (ubatch.embd) {

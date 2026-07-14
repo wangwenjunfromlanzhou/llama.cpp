@@ -827,6 +827,9 @@ class Gemma4DSparkModel(Gemma4Model):
             self.gguf_writer.add_hidden_act(norm)
         if (attn_cap := self.hparams.get("attn_logit_softcapping")) is not None:
             self.gguf_writer.add_attn_logit_softcapping(attn_cap)
+        # Gemma4 Q/K norms absorb the 1/sqrt(d) factor, so the attention scale is 1.0.
+        # Qwen3 DSpark leaves this unset and dflash.cpp falls back to 1/sqrt(d).
+        self.gguf_writer.add_attention_scale(1.0)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:

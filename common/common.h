@@ -328,6 +328,9 @@ struct common_params_speculative_draft {
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+    // DSpark: drop drafted tokens at positions whose predicted acceptance (from
+    // the conf head) falls below this threshold. 0.0 = disabled.
+    float conf_min = 0.0f;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

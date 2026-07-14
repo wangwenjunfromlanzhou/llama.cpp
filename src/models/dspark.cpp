@@ -132,15 +132,36 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * prev = inp->anchors; // I32 [n_blocks]
     res->add_input(std::move(inp));
 
+    // optional confidence head: per-position predicted acceptance probability.
+    // conf_i = sigmoid(conf_proj . concat(h_i, markov_w1[prev_i]) + bias)
+    // h_i is res->t_embd (pre-lm_head hidden state, set by the dflash graph).
+    ggml_tensor * conf_proj = model.dspark_conf_proj;
+    ggml_tensor * h_full    = (conf_proj != nullptr) ? res->t_embd : nullptr; // [n_embd, n_tokens]
+    ggml_tensor * conf_cat  = nullptr;
+
     ggml_tensor * cat = nullptr;
     for (int64_t i = 0; i < bs; ++i) {
-        ggml_tensor * bias = ggml_mul_mat(ctx0, w2, ggml_get_rows(ctx0, w1, prev)); // [n_vocab, n_blocks]
+        ggml_tensor * markov_emb = ggml_get_rows(ctx0, w1, prev); // [R, n_blocks]
+        ggml_tensor * bias       = ggml_mul_mat(ctx0, w2, markov_emb); // [n_vocab, n_blocks]
 
         // position i of every block: strided view [n_vocab, n_blocks]
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, bs*base->nb[1], i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
 
         cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+
+        if (h_full != nullptr) {
+            // h at position i of each block: [n_embd, n_blocks] strided view -> cont
+            // (concat over a strided view is fragile; wrap in cont)
+            ggml_tensor * h_i   = ggml_view_2d(ctx0, h_full, n_embd, n_blocks, bs*h_full->nb[1], i*h_full->nb[1]);
+            ggml_tensor * cat_i = ggml_concat(ctx0, ggml_cont(ctx0, h_i), markov_emb, 0); // [n_embd+R, n_blocks]
+            ggml_tensor * logit = ggml_mul_mat(ctx0, conf_proj, cat_i);  // [1, n_blocks]
+            if (model.dspark_conf_proj_b != nullptr) {
+                logit = ggml_add(ctx0, logit, model.dspark_conf_proj_b);
+            }
+            ggml_tensor * conf_i = ggml_sigmoid(ctx0, logit); // [1, n_blocks]
+            conf_cat = conf_cat ? ggml_concat(ctx0, conf_cat, conf_i, 1) : conf_i;
+        }
 
         if (i + 1 < bs) {
             prev = ggml_argmax(ctx0, col); // I32 [n_blocks]
@@ -154,4 +175,16 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
 
     res->t_logits = out;
     ggml_build_forward_expand(gf, out);
+
+    // emit confidence in the same block-major order, then broadcast to t_embd's
+    // shape and route through t_h_nextn so the existing embeddings_nextn extract
+    // path picks it up (a plain [1, n_tok] output tensor fails backend alloc).
+    if (conf_cat != nullptr) {
+        ggml_tensor * conf = ggml_reshape_3d(ctx0, conf_cat, 1, n_blocks, bs);
+        conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3)); // [1, bs, n_blocks]
+        conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
+        conf = ggml_repeat(ctx0, conf, res->t_embd); // [n_embd, n_tok]
+        res->t_h_nextn = conf;
+        ggml_build_forward_expand(gf, conf);
+    }
 }
